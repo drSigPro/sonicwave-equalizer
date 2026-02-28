@@ -1,0 +1,5 @@
+{
+  "name": "SonicWave Equalizer",
+  "description": "A professional-grade audio equalizer and visualizer with multi-band control, spectrogram analysis, and real-time processing.",
+  "requestFramePermissions": ["microphone"]
+}
