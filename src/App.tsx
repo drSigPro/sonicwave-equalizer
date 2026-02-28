@@ -4,20 +4,19 @@
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { 
-  Play, 
-  Pause, 
-  Square, 
-  Mic, 
-  Upload, 
-  Volume2, 
-  Activity, 
-  Waves, 
+import {
+  Play,
+  Pause,
+  Square,
+  Mic,
+  Upload,
+  Volume2,
+  Activity,
+  Waves,
   Settings2,
   Download,
   RefreshCw
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -65,11 +64,11 @@ const EQ_PRESETS: Record<string, number[]> = {
 };
 
 const SAMPLE_CLIPS = [
-  { name: 'Test Tone (440Hz Sine)', url: 'GENERATE_SINE', label: 'Test Tone' },
-  { name: 'White Noise (Full Spectrum)', url: 'GENERATE_NOISE', label: 'White Noise' },
-  { name: 'Nutcracker (Librosa)', url: 'https://raw.githubusercontent.com/librosa/data/main/nutcracker.ogg', label: 'Nutcracker' },
-  { name: 'Choice (Librosa)', url: 'https://raw.githubusercontent.com/librosa/data/main/choice.ogg', label: 'Choice' },
-  { name: 'Orchestral (Wikimedia)', url: 'https://upload.wikimedia.org/wikipedia/commons/b/bb/Test_tone_880Hz.ogg', label: '880Hz Tone' },
+  { name: 'Dog Bark', url: '/audio/dog_bark.wav', label: '🐶 Dog Bark' },
+  { name: 'Chirping Birds', url: '/audio/chirping_birds.wav', label: '🐦 Chirping Birds' },
+  { name: 'Vacuum Cleaner', url: '/audio/vacuum_cleaner.wav', label: '🧹 Vacuum Cleaner' },
+  { name: 'Thunderstorm', url: '/audio/thunderstorm.wav', label: '⛈️ Thunderstorm' },
+  { name: 'Can Opening', url: '/audio/can_opening.wav', label: '🥫 Can Opening' },
 ];
 
 // --- Components ---
@@ -77,12 +76,19 @@ const SAMPLE_CLIPS = [
 export default function App() {
   // Audio Context & Nodes
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<AudioBufferSourceNode | MediaStreamAudioSourceNode | null>(null);
+  const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
+  const streamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const eqFiltersRef = useRef<BiquadFilterNode[]>([]);
   const gainNodeRef = useRef<GainNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-  
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<BlobPart[]>([]);
+
+  // Use ref for audioBuffer so audio functions always see latest value
+  const audioBufferRef = useRef<AudioBuffer | null>(null);
+
   // State
   const [isPlaying, setIsPlaying] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -94,48 +100,72 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isLoadingSample, setIsLoadingSample] = useState(false);
+  const [recordedObjectUrl, setRecordedObjectUrl] = useState<string | null>(null);
   const playbackStartTimeRef = useRef<number>(0);
   const pausedAtRef = useRef<number>(0);
-  
+
   // Canvas Refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Keep audioBufferRef in sync with state
+  useEffect(() => {
+    audioBufferRef.current = audioBuffer;
+  }, [audioBuffer]);
 
   // --- Audio Engine Initialization ---
   const initAudio = useCallback(() => {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      
+
       analyserRef.current = audioCtxRef.current.createAnalyser();
       analyserRef.current.fftSize = 2048;
       analyserRef.current.smoothingTimeConstant = 0.8;
-      
+
       eqFiltersRef.current = EQ_BANDS.map((band, i) => {
         const filter = audioCtxRef.current!.createBiquadFilter();
         filter.type = 'peaking';
         filter.frequency.value = band.freq;
         filter.Q.value = 1.4;
-        filter.gain.value = eqGains[i];
+        filter.gain.value = 0;
         return filter;
       });
 
       gainNodeRef.current = audioCtxRef.current.createGain();
       gainNodeRef.current.gain.value = volume;
 
+      // Chain: source -> EQ filters -> analyser -> gain -> destination
       for (let i = 0; i < eqFiltersRef.current.length - 1; i++) {
         eqFiltersRef.current[i].connect(eqFiltersRef.current[i + 1]);
       }
-      
+
       eqFiltersRef.current[eqFiltersRef.current.length - 1].connect(analyserRef.current);
       analyserRef.current.connect(gainNodeRef.current);
       gainNodeRef.current.connect(audioCtxRef.current.destination);
     }
   }, [volume]);
 
+  // --- Helper: safely disconnect source nodes ---
+  const cleanupSource = useCallback(() => {
+    if (sourceNodeRef.current) {
+      try {
+        sourceNodeRef.current.disconnect();
+        sourceNodeRef.current.stop();
+      } catch (e) { /* already stopped */ }
+      sourceNodeRef.current = null;
+    }
+    if (streamSourceRef.current) {
+      try {
+        streamSourceRef.current.disconnect();
+      } catch (e) { /* ignore */ }
+      streamSourceRef.current = null;
+    }
+  }, []);
+
   // --- Visualization Loop ---
   const draw = useCallback(() => {
     if (!canvasRef.current || !analyserRef.current) return;
-    
+
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
@@ -148,13 +178,13 @@ export default function App() {
     if (isPlaying && audioCtxRef.current) {
       const elapsed = audioCtxRef.current.currentTime - playbackStartTimeRef.current;
       setCurrentTime(Math.min(elapsed, duration));
-      if (elapsed >= duration) {
+      if (duration > 0 && elapsed >= duration) {
         setIsPlaying(false);
         setCurrentTime(0);
         pausedAtRef.current = 0;
       }
     }
-    
+
     if (viewMode === 'waveform') {
       const dataArray = new Uint8Array(bufferLength);
       analyserRef.current.getByteTimeDomainData(dataArray);
@@ -225,12 +255,12 @@ export default function App() {
 
       // Shift existing image down
       oCtx.drawImage(oCanvas, 0, 1);
-      
+
       // Draw new line at the top
       const sliceWidth = width / bufferLength;
       for (let i = 0; i < bufferLength; i++) {
         const value = dataArray[i];
-        const hue = 240 - (value / 255) * 240; // Blue to Red
+        const hue = 240 - (value / 255) * 240;
         oCtx.fillStyle = `hsl(${hue}, 100%, 50%)`;
         oCtx.fillRect(i * sliceWidth, 0, sliceWidth, 1);
       }
@@ -247,14 +277,12 @@ export default function App() {
       const y = height / 2 - (eqGains[i] / GAIN_RANGE.max) * (height / 4);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
-      
-      // Draw dots for bands
+
       ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
       ctx.fillRect(x - 2, y - 2, 4, 4);
     }
     ctx.stroke();
-    
-    // EQ Label
+
     ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
     ctx.font = '10px monospace';
     ctx.fillText('EQ CURVE', 10, height - 10);
@@ -273,141 +301,6 @@ export default function App() {
     };
   }, [isPlaying, isRecording, draw]);
 
-  // --- Actions ---
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    initAudio();
-    setFileName(file.name);
-    
-    const arrayBuffer = await file.arrayBuffer();
-    const decodedBuffer = await audioCtxRef.current!.decodeAudioData(arrayBuffer);
-    setAudioBuffer(decodedBuffer);
-    setDuration(decodedBuffer.duration);
-    setCurrentTime(0);
-    pausedAtRef.current = 0;
-    stopPlayback();
-  };
-
-  const handleSampleSelect = async (url: string, name: string) => {
-    if (!url) return;
-    console.log(`Loading sample: ${name} from ${url}`);
-    setIsLoadingSample(true);
-    stopPlayback();
-    initAudio();
-    
-    try {
-      let decodedBuffer: AudioBuffer;
-
-      if (url === 'GENERATE_SINE') {
-        console.log('Generating local sine wave...');
-        const sampleRate = audioCtxRef.current!.sampleRate;
-        const length = sampleRate * 2;
-        decodedBuffer = audioCtxRef.current!.createBuffer(1, length, sampleRate);
-        const channelData = decodedBuffer.getChannelData(0);
-        for (let i = 0; i < length; i++) {
-          channelData[i] = Math.sin(2 * Math.PI * 440 * (i / sampleRate));
-        }
-      } else if (url === 'GENERATE_NOISE') {
-        console.log('Generating local white noise...');
-        const sampleRate = audioCtxRef.current!.sampleRate;
-        const length = sampleRate * 2;
-        decodedBuffer = audioCtxRef.current!.createBuffer(1, length, sampleRate);
-        const channelData = decodedBuffer.getChannelData(0);
-        for (let i = 0; i < length; i++) {
-          channelData[i] = Math.random() * 2 - 1;
-        }
-      } else {
-        console.log(`Fetching remote audio file from: ${url}`);
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status} at ${url}`);
-        const arrayBuffer = await response.arrayBuffer();
-        console.log('Decoding audio data...');
-        decodedBuffer = await audioCtxRef.current!.decodeAudioData(arrayBuffer);
-      }
-
-      console.log('Audio loaded successfully.');
-      setAudioBuffer(decodedBuffer);
-      setFileName(name);
-      setDuration(decodedBuffer.duration);
-      setCurrentTime(0);
-      pausedAtRef.current = 0;
-      
-      // Auto-start playback for better UX when selecting samples
-      setTimeout(() => {
-        console.log('Starting auto-playback...');
-        startPlayback();
-      }, 100);
-      
-    } catch (err) {
-      console.error('Error loading sample:', err);
-      alert(`Failed to load sample audio: ${err instanceof Error ? err.message : 'Unknown error'}`);
-    } finally {
-      setIsLoadingSample(false);
-    }
-  };
-
-  const startPlayback = () => {
-    if (!audioBuffer || !audioCtxRef.current) return;
-    
-    if (audioCtxRef.current.state === 'suspended') {
-      audioCtxRef.current.resume();
-    }
-
-    if (sourceNodeRef.current) {
-      sourceNodeRef.current.stop();
-    }
-
-    const source = audioCtxRef.current.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(eqFiltersRef.current[0]);
-    
-    source.onended = () => {
-      if (isPlaying) {
-        setIsPlaying(false);
-        setCurrentTime(0);
-        pausedAtRef.current = 0;
-      }
-    };
-
-    const offset = pausedAtRef.current;
-    source.start(0, offset);
-    playbackStartTimeRef.current = audioCtxRef.current.currentTime - offset;
-    sourceNodeRef.current = source;
-    setIsPlaying(true);
-  };
-
-  const pausePlayback = () => {
-    if (sourceNodeRef.current && audioCtxRef.current) {
-      sourceNodeRef.current.stop();
-      pausedAtRef.current = audioCtxRef.current.currentTime - playbackStartTimeRef.current;
-      sourceNodeRef.current = null;
-    }
-    setIsPlaying(false);
-  };
-
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-
-  const stopPlayback = () => {
-    try {
-      if (sourceNodeRef.current) {
-        sourceNodeRef.current.stop();
-        sourceNodeRef.current = null;
-      }
-    } catch (e) {
-      // Ignore if already stopped
-    }
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => track.stop());
-      mediaStreamRef.current = null;
-    }
-    setIsPlaying(false);
-    setIsRecording(false);
-    setCurrentTime(0);
-    pausedAtRef.current = 0;
-  };
-
   // Clear offscreen canvas when switching modes
   useEffect(() => {
     if (offscreenCanvasRef.current) {
@@ -419,6 +312,125 @@ export default function App() {
     }
   }, [viewMode]);
 
+  // --- Core Audio Functions ---
+  // These use refs instead of state to avoid stale closure issues.
+
+  const stopPlayback = useCallback(() => {
+    cleanupSource();
+
+    // Stop MediaRecorder if running
+    if (mediaRecorderRef.current) {
+      try {
+        if (mediaRecorderRef.current.state === 'recording') {
+          mediaRecorderRef.current.stop();
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      mediaStreamRef.current = null;
+    }
+
+    setIsPlaying(false);
+    setIsRecording(false);
+    setCurrentTime(0);
+    pausedAtRef.current = 0;
+  }, [cleanupSource]);
+
+  const startPlayback = useCallback((bufferOverride?: AudioBuffer) => {
+    const buffer = bufferOverride || audioBufferRef.current;
+    if (!buffer || !audioCtxRef.current) {
+      console.warn('startPlayback: No buffer or audio context available');
+      return;
+    }
+
+    if (audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume();
+    }
+
+    // Clean up any existing sources
+    cleanupSource();
+
+    const source = audioCtxRef.current.createBufferSource();
+    source.buffer = buffer;
+    source.connect(eqFiltersRef.current[0]);
+
+    source.onended = () => {
+      setIsPlaying(false);
+      setCurrentTime(0);
+      pausedAtRef.current = 0;
+      sourceNodeRef.current = null;
+    };
+
+    const offset = pausedAtRef.current;
+    source.start(0, offset);
+    playbackStartTimeRef.current = audioCtxRef.current.currentTime - offset;
+    sourceNodeRef.current = source;
+    setIsPlaying(true);
+  }, [cleanupSource]);
+
+  const pausePlayback = useCallback(() => {
+    if (sourceNodeRef.current && audioCtxRef.current) {
+      pausedAtRef.current = audioCtxRef.current.currentTime - playbackStartTimeRef.current;
+    }
+    cleanupSource();
+    setIsPlaying(false);
+  }, [cleanupSource]);
+
+  // --- Actions ---
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    stopPlayback();
+    initAudio();
+    setFileName(file.name);
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const decodedBuffer = await audioCtxRef.current!.decodeAudioData(arrayBuffer);
+      setAudioBuffer(decodedBuffer);
+      setDuration(decodedBuffer.duration);
+      setCurrentTime(0);
+      pausedAtRef.current = 0;
+    } catch (err) {
+      console.error('Error loading audio file:', err);
+      alert(`Failed to load audio file: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  };
+
+  const handleSampleSelect = async (url: string, name: string) => {
+    if (!url) return;
+    console.log(`Loading sample: ${name} from ${url}`);
+    setIsLoadingSample(true);
+    stopPlayback();
+    initAudio();
+
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status} at ${url}`);
+      const arrayBuffer = await response.arrayBuffer();
+      const decodedBuffer = await audioCtxRef.current!.decodeAudioData(arrayBuffer);
+
+      console.log('Audio loaded successfully.');
+      setAudioBuffer(decodedBuffer);
+      setFileName(name);
+      setDuration(decodedBuffer.duration);
+      setCurrentTime(0);
+      pausedAtRef.current = 0;
+
+      // Auto-start playback — pass buffer directly to avoid stale ref
+      startPlayback(decodedBuffer);
+
+    } catch (err) {
+      console.error('Error loading sample:', err);
+      alert(`Failed to load sample audio: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setIsLoadingSample(false);
+    }
+  };
+
   const toggleRecording = async () => {
     if (isRecording) {
       stopPlayback();
@@ -429,10 +441,49 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
+
+      // Clean up any existing sources
+      cleanupSource();
+
+      // Setup live analysis source
       const source = audioCtxRef.current!.createMediaStreamSource(stream);
       source.connect(eqFiltersRef.current[0]);
-      sourceNodeRef.current = source as any;
+      streamSourceRef.current = source;
+
+      // Setup MediaRecorder to save audio
+      recordedChunksRef.current = [];
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          recordedChunksRef.current.push(e.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(recordedChunksRef.current, { type: 'audio/webm' });
+        const url = URL.createObjectURL(blob);
+        setRecordedObjectUrl(url);
+        setFileName(`Recording_${new Date().toLocaleTimeString().replace(/:/g, '-')}.webm`);
+
+        // Convert to AudioBuffer for replay
+        try {
+          if (!audioCtxRef.current) return;
+          const ab = await blob.arrayBuffer();
+          const decodedBuffer = await audioCtxRef.current.decodeAudioData(ab);
+          setAudioBuffer(decodedBuffer);
+          setDuration(decodedBuffer.duration);
+          setCurrentTime(0);
+          pausedAtRef.current = 0;
+        } catch (err) {
+          console.error('Failed to decode recorded stream to AudioBuffer:', err);
+        }
+      };
+
+      mediaRecorder.start(1000);
       setIsRecording(true);
+
       if (audioCtxRef.current!.state === 'suspended') {
         audioCtxRef.current!.resume();
       }
@@ -446,7 +497,7 @@ export default function App() {
     const newGains = [...eqGains];
     newGains[index] = value;
     setEqGains(newGains);
-    
+
     if (eqFiltersRef.current[index]) {
       eqFiltersRef.current[index].gain.setTargetAtTime(value, audioCtxRef.current?.currentTime || 0, 0.1);
     }
@@ -470,7 +521,7 @@ export default function App() {
   const applyPreset = (presetName: string) => {
     const gains = EQ_PRESETS[presetName];
     if (!gains) return;
-    
+
     setEqGains(gains);
     gains.forEach((gain, i) => {
       if (eqFiltersRef.current[i]) {
@@ -493,19 +544,20 @@ export default function App() {
             <p className="text-[10px] uppercase tracking-[0.2em] text-white/40 font-mono">Precision Audio Engine v2.5</p>
           </div>
         </div>
-        
+
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2 px-3 py-2 rounded-full bg-white/5 border border-white/10">
-            <span className="text-[10px] uppercase tracking-widest text-white/40 font-mono ml-2">Presets:</span>
-            <select 
+            <span className="text-[10px] uppercase tracking-widest text-white/40 font-mono ml-2">Samples:</span>
+            <select
               className="bg-transparent text-sm font-medium outline-none cursor-pointer pr-2"
               onChange={(e) => {
-                const sample = SAMPLE_CLIPS.find(s => s.url === e.target.value);
+                const val = e.target.value;
+                if (!val) return;
+                const sample = SAMPLE_CLIPS.find(s => s.url === val);
                 if (sample) handleSampleSelect(sample.url, sample.name);
-                // Reset select value so same sample can be re-selected
                 e.target.value = "";
               }}
-              value=""
+              defaultValue=""
               disabled={isLoadingSample}
             >
               <option value="" disabled className="bg-[#111]">Select Sample...</option>
@@ -523,12 +575,12 @@ export default function App() {
             <span className="text-sm font-medium">Load Audio</span>
             <input type="file" accept="audio/*" className="hidden" onChange={handleFileUpload} />
           </label>
-          <button 
+          <button
             onClick={toggleRecording}
             className={cn(
               "flex items-center gap-2 px-4 py-2 rounded-full transition-all border",
-              isRecording 
-                ? "bg-red-500/20 border-red-500 text-red-500 shadow-[0_0_15px_rgba(239,68,68,0.2)]" 
+              isRecording
+                ? "bg-red-500/20 border-red-500 text-red-500 shadow-[0_0_15px_rgba(239,68,68,0.2)]"
                 : "bg-white/5 border-white/10 text-white/60 hover:bg-white/10 hover:text-white"
             )}
           >
@@ -544,7 +596,7 @@ export default function App() {
           {/* Main Display */}
           <section className="bg-[#151619] rounded-2xl border border-white/5 overflow-hidden shadow-2xl relative">
             <div className="absolute top-4 right-4 flex gap-2 z-10">
-              <button 
+              <button
                 onClick={() => setViewMode('waveform')}
                 className={cn(
                   "p-2 rounded-lg transition-colors",
@@ -554,7 +606,7 @@ export default function App() {
               >
                 <Waves className="w-4 h-4" />
               </button>
-              <button 
+              <button
                 onClick={() => setViewMode('spectrogram')}
                 className={cn(
                   "p-2 rounded-lg transition-colors",
@@ -564,7 +616,7 @@ export default function App() {
               >
                 <Activity className="w-4 h-4" />
               </button>
-              <button 
+              <button
                 onClick={() => setViewMode('waterfall')}
                 className={cn(
                   "p-2 rounded-lg transition-colors",
@@ -593,10 +645,10 @@ export default function App() {
               </div>
             </div>
 
-            <canvas 
-              ref={canvasRef} 
-              width={800} 
-              height={320} 
+            <canvas
+              ref={canvasRef}
+              width={800}
+              height={320}
               className="w-full h-[320px] block cursor-crosshair"
             />
 
@@ -608,10 +660,10 @@ export default function App() {
                 </p>
               </div>
             )}
-            
+
             {/* Playback Progress */}
             {audioBuffer && !isRecording && (
-              <div 
+              <div
                 className="h-1 bg-white/5 relative cursor-pointer group"
                 onClick={(e) => {
                   const rect = e.currentTarget.getBoundingClientRect();
@@ -623,9 +675,9 @@ export default function App() {
                   if (isPlaying) startPlayback();
                 }}
               >
-                <div 
-                  className="absolute inset-y-0 left-0 bg-green-500 shadow-[0_0_10px_#22c55e] transition-all duration-100" 
-                  style={{ width: `${(currentTime / duration) * 100}%` }}
+                <div
+                  className="absolute inset-y-0 left-0 bg-green-500 shadow-[0_0_10px_#22c55e] transition-all duration-100"
+                  style={{ width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}
                 />
               </div>
             )}
@@ -635,14 +687,14 @@ export default function App() {
           <section className="bg-[#151619] p-6 rounded-2xl border border-white/5 flex items-center justify-between">
             <div className="flex items-center gap-4">
               <div className="relative">
-                <button 
-                  onClick={isPlaying ? pausePlayback : startPlayback}
+                <button
+                  onClick={() => isPlaying ? pausePlayback() : startPlayback()}
                   disabled={!audioBuffer || isRecording}
                   className={cn(
                     "w-14 h-14 rounded-full flex items-center justify-center transition-all shadow-lg",
-                    isPlaying 
-                      ? "bg-white text-black hover:scale-105" 
-                      : audioBuffer 
+                    isPlaying
+                      ? "bg-white text-black hover:scale-105"
+                      : audioBuffer
                         ? "bg-green-500 text-black hover:scale-110 shadow-[0_0_20px_rgba(34,197,94,0.4)]"
                         : "bg-white/5 text-white/20 border border-white/10"
                   )}
@@ -654,9 +706,9 @@ export default function App() {
                   {isPlaying ? 'Running' : audioBuffer ? 'Run Analysis' : 'Load audio to start'}
                 </div>
               </div>
-              <button 
+              <button
                 onClick={stopPlayback}
-                disabled={(!isPlaying && !isRecording) || !audioBuffer}
+                disabled={(!isPlaying && !isRecording)}
                 className="w-12 h-12 rounded-full bg-white/5 border border-white/10 flex items-center justify-center hover:bg-white/10 transition-all disabled:opacity-20"
                 title="Stop"
               >
@@ -666,11 +718,11 @@ export default function App() {
 
             <div className="flex items-center gap-6 flex-1 max-w-md px-8">
               <Volume2 className="w-5 h-5 text-white/40" />
-              <input 
-                type="range" 
-                min="0" 
-                max="1" 
-                step="0.01" 
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
                 value={volume}
                 onChange={(e) => updateVolume(parseFloat(e.target.value))}
                 className="flex-1 accent-green-500 h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
@@ -689,7 +741,7 @@ export default function App() {
                   <Settings2 className="w-5 h-5 text-green-500" />
                   <h2 className="font-bold tracking-tight">Equalizer</h2>
                 </div>
-                <button 
+                <button
                   onClick={resetEq}
                   className="text-[10px] uppercase tracking-widest text-white/40 hover:text-white transition-colors flex items-center gap-1"
                 >
@@ -697,10 +749,10 @@ export default function App() {
                   Reset
                 </button>
               </div>
-              
+
               <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10">
                 <span className="text-[10px] uppercase tracking-widest text-white/40 font-mono">Preset:</span>
-                <select 
+                <select
                   className="bg-transparent text-xs font-medium outline-none cursor-pointer flex-1"
                   onChange={(e) => applyPreset(e.target.value)}
                   value={Object.keys(EQ_PRESETS).find(key => JSON.stringify(EQ_PRESETS[key]) === JSON.stringify(eqGains)) || ""}
@@ -719,17 +771,17 @@ export default function App() {
                   <div className="relative flex-1 w-8 flex justify-center">
                     {/* Track Background */}
                     <div className="absolute inset-y-0 w-1 bg-white/5 rounded-full" />
-                    
+
                     {/* Slider Input */}
-                    <input 
+                    <input
                       type="range"
                       min={GAIN_RANGE.min}
                       max={GAIN_RANGE.max}
                       step="0.5"
                       value={eqGains[i]}
                       onChange={(e) => updateEqGain(i, parseFloat(e.target.value))}
-                      style={{ 
-                        writingMode: 'vertical-lr', 
+                      style={{
+                        writingMode: 'vertical-lr',
                         direction: 'rtl',
                         appearance: 'none',
                         background: 'transparent',
@@ -739,16 +791,16 @@ export default function App() {
                       }}
                       className="relative z-10 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-green-500 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:shadow-[0_0_10px_#22c55e] [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-black"
                     />
-                    
+
                     {/* Value Indicator */}
-                    <div 
+                    <div
                       className="absolute left-full ml-1 text-[8px] font-mono text-green-500/60 opacity-0 group-hover:opacity-100 transition-opacity"
                       style={{ bottom: `${((eqGains[i] - GAIN_RANGE.min) / (GAIN_RANGE.max - GAIN_RANGE.min)) * 100}%` }}
                     >
                       {eqGains[i] > 0 ? '+' : ''}{eqGains[i]}dB
                     </div>
                   </div>
-                  
+
                   <div className="text-center">
                     <div className="text-[10px] font-mono text-white/40 group-hover:text-white transition-colors">{band.label}</div>
                     <div className="text-[8px] text-white/20 uppercase tracking-tighter">Hz</div>
@@ -759,10 +811,22 @@ export default function App() {
 
             <div className="p-6 bg-black/20 rounded-b-2xl">
               <div className="grid grid-cols-2 gap-3">
-                <button className="flex items-center justify-center gap-2 py-2 rounded-lg bg-white/5 border border-white/10 text-xs font-medium hover:bg-white/10 transition-colors">
-                  <Download className="w-3 h-3" />
-                  Save Preset
-                </button>
+                {recordedObjectUrl && (
+                  <a
+                    href={recordedObjectUrl}
+                    download={fileName || "SonicWave_Recording.webm"}
+                    className="flex items-center justify-center gap-2 py-2 rounded-lg bg-green-500/10 text-green-500 border border-green-500/20 text-xs font-medium hover:bg-green-500/20 hover:border-green-500/40 transition-colors"
+                  >
+                    <Download className="w-3 h-3" />
+                    Download Recording
+                  </a>
+                )}
+                {!recordedObjectUrl && (
+                  <button className="flex items-center justify-center gap-2 py-2 rounded-lg bg-white/5 border border-white/10 text-xs font-medium hover:bg-white/10 transition-colors">
+                    <Download className="w-3 h-3" />
+                    Save Preset
+                  </button>
+                )}
                 <button className="flex items-center justify-center gap-2 py-2 rounded-lg bg-white/5 border border-white/10 text-xs font-medium hover:bg-white/10 transition-colors">
                   <Settings2 className="w-3 h-3" />
                   Advanced
@@ -786,7 +850,7 @@ export default function App() {
           </div>
         </div>
         <div className="text-[10px] font-mono text-white/20 uppercase tracking-widest flex items-center gap-4">
-          <button 
+          <button
             onClick={() => {
               if (audioCtxRef.current) {
                 audioCtxRef.current.close().then(() => {
